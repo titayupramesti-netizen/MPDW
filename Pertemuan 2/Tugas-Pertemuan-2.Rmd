@@ -1,0 +1,498 @@
+---
+title: "Tugas Pertemuan 2 - Metode Pemulusan Deret Waktu"
+author: "Tita Ayu Pramesti"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: cosmo
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Deskripsi Data
+
+Data yang digunakan adalah anomali suhu global bulanan (global
+temperature anomaly) dalam satuan derajat Celsius, periode April 1993 -
+Juli 2001, sebanyak 100 observasi (bagian data individu dari kelompok).
+
+# Library/Packages
+
+Package yang digunakan pada analisis ini adalah `forecast`, `graphics`,
+`TTR`, dan `rio`.
+
+```{r}
+library("forecast")
+library("graphics")
+library("TTR")
+library("rio")
+```
+
+# Impor Data
+
+```{r}
+data1 <- import("data mpdw untuk praktikum.xlsx")
+head(data1)
+```
+
+# Eksplorasi Data
+
+```{r}
+str(data1)
+dim(data1)
+```
+
+```{r}
+data1.ts <- ts(data1$global_temperature_anomaly_C)
+summary(data1.ts)
+```
+
+```{r}
+ts.plot(data1.ts, xlab = "Periode", ylab = "Anomali Suhu (C)",
+        main = "Plot Deret Waktu - Anomali Suhu Global")
+points(data1.ts)
+```
+
+Berdasarkan plot di atas, data memperlihatkan **pola tren naik** dengan
+fluktuasi/noise di sekitarnya, dan secara visual tidak menunjukkan pola
+musiman (seasonal) yang jelas -- hal ini wajar karena data anomali suhu
+pada dasarnya sudah merupakan deviasi terhadap rata-rata klimatologis
+bulanan, sehingga efek musiman relatif sudah hilang. Untuk memvalidasi
+dugaan tersebut, pada analisis ini tetap diterapkan **enam metode**
+pemulusan yang telah dipelajari, yaitu **SMA, DMA, SES, DES, Winter
+Aditif, dan Winter Multiplikatif**, kemudian dibandingkan kinerjanya
+menggunakan SSE, MSE, dan MAPE.
+
+# Pembagian Data
+
+Data dibagi menjadi 80% data latih dan 20% data uji.
+
+```{r}
+n <- nrow(data1)
+n_train <- floor(0.8 * n)
+
+training <- data1[1:n_train, ]
+testing  <- data1[(n_train + 1):n, ]
+
+train.ts <- ts(training$global_temperature_anomaly_C)
+test.ts  <- ts(testing$global_temperature_anomaly_C)
+
+n_train
+n - n_train
+```
+
+```{r}
+plot(data1.ts, col = "red", main = "Plot Semua Data")
+points(data1.ts)
+```
+
+```{r}
+plot(train.ts, col = "blue", main = "Plot Data Latih")
+points(train.ts)
+```
+
+```{r}
+plot(test.ts, col = "blue", main = "Plot Data Uji")
+points(test.ts)
+```
+
+```{r}
+library(ggplot2)
+ggplot() +
+  geom_line(data = training, aes(x = timestamp, y = global_temperature_anomaly_C, col = "Data Latih", group = 1)) +
+  geom_line(data = testing, aes(x = timestamp, y = global_temperature_anomaly_C, col = "Data Uji", group = 1)) +
+  labs(x = "Periode Waktu", y = "Anomali Suhu (C)", color = "Keterangan:") +
+  scale_colour_manual(breaks = c("Data Latih", "Data Uji"),
+                      values = c("blue", "red")) +
+  theme_bw() + 
+  theme(legend.position = "bottom",
+        plot.caption = element_text(hjust = 0.5, size = 12))
+```
+
+# Metode 1: Single Moving Average (SMA)
+
+```{r}
+data.sma <- SMA(train.ts, n = 4)
+data.sma
+```
+
+```{r}
+data.ramal.sma <- c(NA, data.sma)
+forecast.sma <- rep(data.ramal.sma[length(data.ramal.sma)], length(test.ts) - 1)
+
+data.gab.sma <- cbind(
+  aktual = c(data1.ts),
+  pemulusan = c(data.sma, rep(NA, length(test.ts))),
+  ramalan = c(data.ramal.sma, rep(data.ramal.sma[length(data.ramal.sma)], length(test.ts) - 1))
+)
+data.gab.sma
+```
+
+```{r}
+ts.plot(data1.ts, xlab = "Periode", ylab = "Anomali",
+        main = "Plot SMA")
+points(data1.ts)
+lines(data.gab.sma[,2], col = "green", lwd = 2)
+lines(data.gab.sma[,3], col = "red", lwd = 2)
+legend("topleft", c("Aktual", "Pemulusan", "Ramalan"),
+       lty = 1, col = c("black", "green", "red"), cex = 0.7)
+```
+
+## Akurasi Data Latih - SMA
+
+```{r}
+error_train.sma <- train.ts - data.ramal.sma[1:length(train.ts)]
+SSE_train.sma <- sum(error_train.sma[5:length(train.ts)]^2)
+MSE_train.sma <- mean(error_train.sma[5:length(train.ts)]^2)
+MAPE_train.sma <- mean(abs(error_train.sma[5:length(train.ts)]/train.ts[5:length(train.ts)])) * 100
+
+akurasi_train.sma <- matrix(c(SSE_train.sma, MSE_train.sma, MAPE_train.sma))
+row.names(akurasi_train.sma) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_train.sma) <- "Akurasi Data Latih SMA"
+akurasi_train.sma
+```
+
+## Akurasi Data Uji - SMA
+
+```{r}
+error_test.sma <- test.ts - data.gab.sma[(n_train+1):n, 3]
+SSE_test.sma <- sum(error_test.sma^2)
+MSE_test.sma <- mean(error_test.sma^2)
+MAPE_test.sma <- mean(abs(error_test.sma/test.ts)) * 100
+
+akurasi_test.sma <- matrix(c(SSE_test.sma, MSE_test.sma, MAPE_test.sma))
+row.names(akurasi_test.sma) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_test.sma) <- "Akurasi Data Uji SMA"
+akurasi_test.sma
+```
+
+# Metode 2: Double Moving Average (DMA)
+
+```{r}
+dma <- SMA(data.sma, n = 4)
+At <- 2 * data.sma - dma
+Bt <- 2 / (4 - 1) * (data.sma - dma)
+data.dma <- At + Bt
+data.ramal2.dma <- c(NA, data.dma)
+
+h <- length(test.ts)
+f <- c()
+for (i in 1:h) {
+  f[i] <- At[length(At)] + Bt[length(Bt)] * i
+}
+
+data.gab2.dma <- cbind(
+  aktual = c(data1.ts),
+  pemulusan1 = c(data.sma, rep(NA, h)),
+  pemulusan2 = c(dma, rep(NA, h)),
+  At = c(At, rep(NA, h)),
+  Bt = c(Bt, rep(NA, h)),
+  ramalan = c(data.ramal2.dma, f[-1])
+)
+data.gab2.dma
+```
+
+```{r}
+ts.plot(data1.ts, xlab = "Periode", ylab = "Anomali",
+        main = "Plot DMA")
+points(data1.ts)
+lines(data.gab2.dma[,6], col = "red", lwd = 2)
+legend("topleft", c("Aktual", "Ramalan DMA"),
+       lty = 1, col = c("black", "red"), cex = 0.7)
+```
+
+## Akurasi Data Latih - DMA
+
+```{r}
+error_train.dma <- train.ts - data.ramal2.dma[1:length(train.ts)]
+SSE_train.dma <- sum(error_train.dma[8:length(train.ts)]^2)
+MSE_train.dma <- mean(error_train.dma[8:length(train.ts)]^2)
+MAPE_train.dma <- mean(abs(error_train.dma[8:length(train.ts)]/train.ts[8:length(train.ts)])) * 100
+
+akurasi_train.dma <- matrix(c(SSE_train.dma, MSE_train.dma, MAPE_train.dma))
+row.names(akurasi_train.dma) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_train.dma) <- "Akurasi Data Latih DMA"
+akurasi_train.dma
+```
+
+## Akurasi Data Uji - DMA
+
+```{r}
+error_test.dma <- test.ts - data.gab2.dma[(n_train+1):n, 6]
+SSE_test.dma <- sum(error_test.dma^2)
+MSE_test.dma <- mean(error_test.dma^2)
+MAPE_test.dma <- mean(abs(error_test.dma/test.ts)) * 100
+
+akurasi_test.dma <- matrix(c(SSE_test.dma, MSE_test.dma, MAPE_test.dma))
+row.names(akurasi_test.dma) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_test.dma) <- "Akurasi Data Uji DMA"
+akurasi_test.dma
+```
+
+# Metode 3: Single Exponential Smoothing (SES)
+
+SES cocok untuk data tanpa tren, namun tetap dicobakan sebagai
+pembanding. Digunakan nilai alpha optimum (dipilih otomatis oleh fungsi
+`ses()`).
+
+```{r}
+ses.opt <- ses(train.ts, h = length(test.ts), alpha = NULL)
+plot(ses.opt)
+ses.opt$model
+```
+
+## Akurasi Data Latih - SES
+
+```{r}
+ses.fitted <- ses.opt$fitted
+error_train.ses <- train.ts - ses.fitted
+SSE_train.ses <- sum(error_train.ses^2)
+MSE_train.ses <- mean(error_train.ses^2)
+MAPE_train.ses <- mean(abs(error_train.ses/train.ts)) * 100
+
+akurasi_train.ses <- matrix(c(SSE_train.ses, MSE_train.ses, MAPE_train.ses))
+row.names(akurasi_train.ses) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_train.ses) <- "Akurasi Data Latih SES"
+akurasi_train.ses
+```
+
+## Akurasi Data Uji - SES
+
+```{r}
+ses.forecast <- as.numeric(ses.opt$mean)
+error_test.ses <- test.ts - ses.forecast
+SSE_test.ses <- sum(error_test.ses^2)
+MSE_test.ses <- mean(error_test.ses^2)
+MAPE_test.ses <- mean(abs(error_test.ses/test.ts)) * 100
+
+akurasi_test.ses <- matrix(c(SSE_test.ses, MSE_test.ses, MAPE_test.ses))
+row.names(akurasi_test.ses) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_test.ses) <- "Akurasi Data Uji SES"
+akurasi_test.ses
+```
+
+# Metode 4: Double Exponential Smoothing (DES)
+
+Karena data memiliki pola tren, DES (Holt's method dengan trend, tanpa
+musiman) diperkirakan lebih sesuai dibanding SES. Digunakan alpha dan
+beta optimum.
+
+```{r}
+des.opt <- HoltWinters(train.ts, gamma = FALSE)
+des.opt
+plot(des.opt)
+```
+
+```{r}
+ramalan.des <- forecast(des.opt, h = length(test.ts))
+plot(ramalan.des)
+```
+
+## Akurasi Data Latih - DES
+
+```{r}
+des.fitted <- des.opt$fitted[,1]
+error_train.des <- train.ts[-(1:2)] - des.fitted
+SSE_train.des <- sum(error_train.des^2)
+MSE_train.des <- mean(error_train.des^2)
+MAPE_train.des <- mean(abs(error_train.des/train.ts[-(1:2)])) * 100
+
+akurasi_train.des <- matrix(c(SSE_train.des, MSE_train.des, MAPE_train.des))
+row.names(akurasi_train.des) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_train.des) <- "Akurasi Data Latih DES"
+akurasi_train.des
+```
+
+## Akurasi Data Uji - DES
+
+```{r}
+des.forecast <- as.numeric(ramalan.des$mean)
+error_test.des <- test.ts - des.forecast
+SSE_test.des <- sum(error_test.des^2)
+MSE_test.des <- mean(error_test.des^2)
+MAPE_test.des <- mean(abs(error_test.des/test.ts)) * 100
+
+akurasi_test.des <- matrix(c(SSE_test.des, MSE_test.des, MAPE_test.des))
+row.names(akurasi_test.des) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_test.des) <- "Akurasi Data Uji DES"
+akurasi_test.des
+```
+
+# Metode 5: Winter Aditif
+
+Winter butuh data ts dengan frequency (periode musiman), jadi dibuat
+objek time series baru khusus (frequency = 12, karena data bulanan):
+
+```{r}
+train.ts.w <- ts(training$global_temperature_anomaly_C, frequency = 12, start = c(1993, 4))
+test.ts.w  <- ts(testing$global_temperature_anomaly_C, frequency = 12)
+h <- length(test.ts.w)
+```
+
+```{r}
+winter1 <- HoltWinters(train.ts.w, seasonal = "additive")
+winter1
+plot(winter1)
+```
+
+```{r}
+ramalan.w1 <- forecast(winter1, h = h)
+plot(ramalan.w1)
+```
+
+## Akurasi Data Latih - Winter Aditif
+
+```{r}
+fitted.w1 <- winter1$fitted[,1]
+train.w1  <- window(train.ts.w, start = start(fitted.w1))
+error_train.w1 <- as.numeric(train.w1) - as.numeric(fitted.w1)
+SSE_train.w1 <- sum(error_train.w1^2)
+MSE_train.w1 <- mean(error_train.w1^2)
+MAPE_train.w1 <- mean(abs(error_train.w1/as.numeric(train.w1))) * 100
+
+akurasi_train.w1 <- matrix(c(SSE_train.w1, MSE_train.w1, MAPE_train.w1))
+row.names(akurasi_train.w1) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_train.w1) <- "Akurasi Data Latih Winter Aditif"
+akurasi_train.w1
+```
+
+## Akurasi Data Uji - Winter Aditif
+
+```{r}
+forecast.w1 <- as.numeric(ramalan.w1$mean)
+error_test.w1 <- as.numeric(test.ts.w) - forecast.w1
+SSE_test.w1 <- sum(error_test.w1^2)
+MSE_test.w1 <- mean(error_test.w1^2)
+MAPE_test.w1 <- mean(abs(error_test.w1/as.numeric(test.ts.w))) * 100
+
+akurasi_test.w1 <- matrix(c(SSE_test.w1, MSE_test.w1, MAPE_test.w1))
+row.names(akurasi_test.w1) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_test.w1) <- "Akurasi Data Uji Winter Aditif"
+akurasi_test.w1
+```
+
+# Metode 6: Winter Multiplikatif
+
+```{r}
+winter2 <- HoltWinters(train.ts.w, seasonal = "multiplicative")
+winter2
+plot(winter2)
+```
+
+```{r}
+ramalan.w2 <- forecast(winter2, h = h)
+plot(ramalan.w2)
+```
+
+## Akurasi Data Latih - Winter Multiplikatif
+
+```{r}
+fitted.w2 <- winter2$fitted[,1]
+train.w2  <- window(train.ts.w, start = start(fitted.w2))
+error_train.w2 <- as.numeric(train.w2) - as.numeric(fitted.w2)
+SSE_train.w2 <- sum(error_train.w2^2)
+MSE_train.w2 <- mean(error_train.w2^2)
+MAPE_train.w2 <- mean(abs(error_train.w2/as.numeric(train.w2))) * 100
+
+akurasi_train.w2 <- matrix(c(SSE_train.w2, MSE_train.w2, MAPE_train.w2))
+row.names(akurasi_train.w2) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_train.w2) <- "Akurasi Data Latih Winter Multiplikatif"
+akurasi_train.w2
+```
+
+## Akurasi Data Uji - Winter Multiplikatif
+
+```{r}
+forecast.w2 <- as.numeric(ramalan.w2$mean)
+error_test.w2 <- as.numeric(test.ts.w) - forecast.w2
+SSE_test.w2 <- sum(error_test.w2^2)
+MSE_test.w2 <- mean(error_test.w2^2)
+MAPE_test.w2 <- mean(abs(error_test.w2/as.numeric(test.ts.w))) * 100
+
+akurasi_test.w2 <- matrix(c(SSE_test.w2, MSE_test.w2, MAPE_test.w2))
+row.names(akurasi_test.w2) <- c("SSE", "MSE", "MAPE")
+colnames(akurasi_test.w2) <- "Akurasi Data Uji Winter Multiplikatif"
+akurasi_test.w2
+```
+
+# Perbandingan Metode & Kesimpulan
+
+```{r}
+perbandingan <- data.frame(
+  Metode = c("SMA (m=4)", "DMA (m=4)", "SES (alpha optimum)",
+             "DES (Holt, alpha & beta optimum)",
+             "Winter Aditif", "Winter Multiplikatif"),
+  SSE_Latih = c(SSE_train.sma, SSE_train.dma, SSE_train.ses, SSE_train.des,
+                SSE_train.w1, SSE_train.w2),
+  MSE_Latih = c(MSE_train.sma, MSE_train.dma, MSE_train.ses, MSE_train.des,
+                MSE_train.w1, MSE_train.w2),
+  MAPE_Latih = c(MAPE_train.sma, MAPE_train.dma, MAPE_train.ses, MAPE_train.des,
+                 MAPE_train.w1, MAPE_train.w2),
+  SSE_Uji = c(SSE_test.sma, SSE_test.dma, SSE_test.ses, SSE_test.des,
+              SSE_test.w1, SSE_test.w2),
+  MSE_Uji = c(MSE_test.sma, MSE_test.dma, MSE_test.ses, MSE_test.des,
+              MSE_test.w1, MSE_test.w2),
+  MAPE_Uji = c(MAPE_test.sma, MAPE_test.dma, MAPE_test.ses, MAPE_test.des,
+               MAPE_test.w1, MAPE_test.w2)
+)
+knitr::kable(perbandingan, digits = 4)
+```
+
+Keenam metode di atas dibandingkan untuk melihat metode mana yang paling
+sesuai dengan karakteristik data. Metode Winter (Aditif dan
+Multiplikatif) sengaja tetap disertakan sebagai pembanding/validasi
+terhadap dugaan awal bahwa data tidak memiliki pola musiman yang kuat.
+
+**Metode terbaik dipilih berdasarkan nilai MAPE data uji terkecil**
+(karena MAPE tidak bergantung pada satuan/skala data sehingga lebih adil
+untuk dibandingkan antar metode).
+
+```{r}
+terbaik <- perbandingan$Metode[which.min(perbandingan$MAPE_Uji)]
+terbaik
+```
+
+Berdasarkan tabel perbandingan di atas, metode dengan **MAPE data uji
+terkecil** adalah metode yang dipilih sebagai metode pemulusan terbaik
+untuk data anomali suhu global ini, yaitu **`r terbaik`** (lihat objek
+`terbaik`), dengan MAPE data uji sebesar
+`r round(min(perbandingan$MAPE_Uji), 2)`%.
+
+Beberapa catatan penting dari hasil di atas:
+
+- Pada data ini, DMA (Double Moving Average) memberikan MAPE data uji
+  terkecil dibandingkan tiga metode lain, menunjukkan bahwa memasukkan
+  unsur tren ke dalam pemulusan (melalui komponen $A_t$ dan $B_t$)
+  membantu mengikuti kenaikan nilai anomali suhu dari waktu ke waktu,
+  dibandingkan SMA yang mengasumsikan data relatif konstan.
+- Menariknya, pada model DES (`HoltWinters` dengan `gamma = FALSE`),
+  nilai beta optimum yang terpilih adalah 0, yang berarti algoritma
+  justru menyimpulkan komponen tren tidak banyak membantu pada rentang
+  data latih ini -- sehingga performa DES menjadi hampir identik dengan
+  SES. Ini menunjukkan bahwa tren pada data cenderung lemah/tidak
+  konsisten dalam jangka pendek (banyak fluktuasi/noise), meski secara
+  visual tetap terlihat naik dalam jangka panjang.
+- Secara umum, keenam metode menghasilkan MAPE data uji pada kisaran
+  22-25%, yang tergolong cukup tinggi -- ini wajar karena data anomali
+  suhu memang sangat fluktuatif (noisy) dari bulan ke bulan sehingga
+  sulit diprediksi hanya dengan metode pemulusan sederhana.
+
+**Kesimpulan:** metode **DMA (m = 4)** dipilih sebagai metode pemulusan
+terbaik untuk data ini karena secara konsisten memberikan SSE, MSE, dan
+MAPE data uji yang paling kecil di antara SMA, SES, dan DES.
+
+Ditambahkan pula perbandingan dengan metode musiman (Winter Aditif dan
+Winter Multiplikatif) sebagai validasi terhadap dugaan awal bahwa data
+tidak memiliki pola musiman. Hasilnya menunjukkan Winter Aditif
+memberikan MAPE data uji sebesar 24,70% (lebih baik dari SMA namun tetap
+kalah dari DMA), sedangkan Winter Multiplikatif memberikan hasil yang
+jauh lebih buruk (MAPE ≈ 49%) karena data tidak memiliki struktur
+musiman multiplikatif. Hal ini memperkuat kesimpulan bahwa DMA tetap
+menjadi metode pemulusan terbaik untuk data ini.
