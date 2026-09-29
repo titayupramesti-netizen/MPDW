@@ -1,0 +1,550 @@
+---
+title: "Praktikum MPDW: Pemodelan ARIMA pada Data Suhu Rata-rata Mingguan"
+author: "Tita Ayu Pramesti - M0401241013"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+    theme: cosmo
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", fig.width = 9, fig.height = 4.5)
+```
+
+# Pendahuluan
+
+Dokumen ini berisi penerapan seluruh tahapan pemodelan ARIMA (Autoregressive Integrated Moving Average) pada data iklim harian stasiun BMKG (`climate_data.csv`). Peubah yang dimodelkan adalah suhu rata-rata (`Tavg`, °C) yang dirata-ratakan per minggu.
+
+Tahapan yang dikerjakan:
+
+1. Pembagian data latih (train) dan data uji (test)
+2. Eksplorasi dan pengecekan kestasioneran data latih dalam rataan (plot, ACF, uji ADF) dan ragam (Box-Cox)
+3. Penanganan ketidakstasioneran (differencing / transformasi)
+4. Identifikasi model potensial (ACF, PACF, EACF)
+5. Pendugaan parameter, uji signifikansi, dan pemilihan model berdasarkan AIC
+6. Analisis sisaan
+7. Overfitting
+8. Peramalan (forecasting) dan evaluasi akurasi
+
+## Paket yang digunakan
+
+```{r pustaka}
+library(forecast)   
+library(tseries)   
+library(TSA)        
+library(lmtest)     
+library(ggplot2)
+library(lubridate)
+library(zoo)
+library(knitr)
+```
+
+# Data
+
+## Pengambilan dan pembersihan data
+
+Data `climate_data.csv` berisi 173 stasiun dengan data harian 2010-2020. Pada praktikum ini dipilih satu stasiun dengan data `Tavg` paling lengkap (ID `96071`, 4.000 dari 4.018 hari terisi). Data stasiun tersebut disimpan di `climate_data_96071.csv` agar ukuran repositori kecil. Stasiun dapat diganti lewat peubah `stasiun` (isi file dengan subset stasiun yang sesuai).
+
+Langkah pembersihan:
+
+- Nilai `Tavg` di luar rentang 15-35 °C dianggap kesalahan pencatatan (kode data hilang / salah input) dan diubah menjadi `NA`.
+- Data harian dirata-ratakan per minggu (Senin-Minggu) sehingga diperoleh deret waktu mingguan.
+- Minggu yang tidak memiliki satu pun pengamatan diisi dengan interpolasi linear.
+
+```{r data}
+stasiun <- 96071
+
+raw <- read.csv("C:\\Users\\Tita\\Downloads\\climate_data.csv\\climate_data.csv")
+raw$date <- as.Date(raw$date, format = "%d-%m-%Y")
+raw <- subset(raw, station_id == stasiun)
+
+n_outlier <- sum(raw$Tavg < 15 | raw$Tavg > 35, na.rm = TRUE)
+raw$Tavg[raw$Tavg < 15 | raw$Tavg > 35] <- NA
+
+raw$minggu <- floor_date(raw$date, "week", week_start = 1)
+wk <- aggregate(Tavg ~ minggu, data = raw, FUN = mean)
+
+kal <- data.frame(minggu = seq(min(wk$minggu), max(wk$minggu), by = "week"))
+dat <- merge(kal, wk, by = "minggu", all.x = TRUE)
+n_kosong <- sum(is.na(dat$Tavg))
+dat$y <- na.approx(dat$Tavg, rule = 2)
+
+n <- nrow(dat)
+```
+
+Jumlah pengamatan mingguan: `r n` (memenuhi syarat minimal 500 amatan), periode `r format(min(dat$minggu))` sampai `r format(max(dat$minggu))`. Terdapat `r n_outlier` nilai harian yang dibuang karena di luar rentang wajar dan `r n_kosong` minggu yang diisi interpolasi.
+
+```{r ringkasan}
+kable(data.frame(
+  Statistik = c("Banyak amatan", "Rata-rata", "Simpangan baku", "Minimum", "Median", "Maksimum"),
+  Nilai = round(c(n, mean(dat$y), sd(dat$y), min(dat$y), median(dat$y), max(dat$y)), 3)))
+```
+
+```{r plot-all}
+ggplot(dat, aes(minggu, y)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Suhu Rata-rata Mingguan", x = "Minggu", y = "Tavg (°C)") +
+  theme_minimal()
+```
+
+# Tahap 1: Pembagian Data Latih dan Data Uji
+
+Data dibagi dengan proporsi 80% data latih dan 20% data uji berdasarkan urutan waktu (data uji adalah bagian paling akhir deret).
+
+```{r split}
+n_test  <- round(0.2 * n)
+n_train <- n - n_test
+
+train <- dat[1:n_train, ]
+test  <- dat[(n_train + 1):n, ]
+
+train_ts <- ts(train$y)
+test_ts  <- ts(test$y)
+full_ts  <- ts(dat$y)
+
+kable(data.frame(Data = c("Latih", "Uji"),
+                 Banyak = c(n_train, n_test),
+                 Proporsi = paste0(round(100 * c(n_train, n_test) / n, 1), "%"),
+                 Periode = c(paste(min(train$minggu), "s.d.", max(train$minggu)),
+                             paste(min(test$minggu), "s.d.", max(test$minggu)))))
+```
+
+```{r plot-split}
+dat$set <- rep(c("Latih", "Uji"), c(n_train, n_test))
+ggplot(dat, aes(minggu, y, color = set)) +
+  geom_line() +
+  scale_color_manual(values = c(Latih = "steelblue", Uji = "firebrick")) +
+  labs(title = "Pembagian Data Latih dan Uji", x = "Minggu", y = "Tavg (°C)", color = "") +
+  theme_minimal()
+```
+
+# Tahap 2: Uji Kestasioneran Data Latih
+
+## Kestasioneran dalam rataan
+
+### Plot deret waktu
+
+```{r plot-train}
+ggplot(train, aes(minggu, y)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Data Latih", x = "Minggu", y = "Tavg (°C)") +
+  theme_minimal()
+```
+
+Plot data latih menunjukkan bahwa suhu rata-rata mingguan berfluktuasi di sekitar nilai tengah sekitar 26 °C, dengan rentang sekitar 23,5 °C sampai 27,8 °C. Tidak terlihat tren naik atau turun yang jelas sepanjang 2010-2018, sehingga data terindikasi stasioner dalam rataan. Namun, terlihat pola naik-turun yang berulang kira-kira setiap tahun (suhu cenderung lebih tinggi di sekitar pertengahan tahun dan turun di sekitar awal tahun), yang mengindikasikan adanya pola musiman ringan. Lebar fluktuasi relatif seragam dari waktu ke waktu, sehingga ragam terindikasi konstan. Dugaan ini akan dipastikan dengan ACF, uji ADF, dan Box-Cox.
+
+### Plot ACF
+
+```{r acf-train}
+acf(train_ts, lag.max = 40, main = "ACF Data Latih")
+```
+
+Plot ACF data latih menunjukkan autokorelasi yang tinggi pada lag awal (sekitar 0,58 pada lag 1). Nilainya kemudian meluruh secara bertahap dan mendekati nol pada sekitar lag 12-13, yaitu pola tails off yang relatif cepat, bukan pola turun sangat lambat yang khas deret tidak stasioner dalam rataan. Setelah itu ACF berubah negatif dan membentuk gelombang. Nilai negatif terbesar (sekitar -0,33) berada di sekitar lag 21-23, dan banyak lag yang melewati batas signifikansi (garis biru putus-putus). Pola gelombang ini mengindikasikan adanya komponen musiman (siklus sekitar satu tahun atau 52 minggu) pada data. Secara keseluruhan, ACF mendukung dugaan bahwa data latih stasioner dalam rataan, yang akan dikonfirmasi dengan uji ADF.
+
+### Uji ADF (Augmented Dickey-Fuller)
+
+Hipotesis:
+
+- $H_0$: data tidak stasioner (memiliki akar unit)
+- $H_1$: data stasioner
+
+Kriteria: tolak $H_0$ jika p-value < 0,05.
+
+```{r adf-train}
+adf_train <- adf.test(train_ts)
+adf_train
+```
+
+**Kesimpulan:** Uji ADF menghasilkan statistik Dickey-Fuller = -4,2544 dengan lag order 7 dan p-value ≤ 0,01. Karena p-value < 0,05, H0 ditolak sehingga data latih stasioner dalam rataan. Hasil ini sejalan dengan plot deret waktu dan ACF yang meluruh menuju nol, sehingga differencing tidak diperlukan (d = 0).
+
+## Kestasioneran dalam ragam (Box-Cox)
+
+Hipotesis dan kriteria: data stasioner dalam ragam jika selang kepercayaan 95% nilai $\lambda$ mengandung angka 1 (tidak perlu transformasi). Jika $\lambda$ optimum = 0 maka digunakan transformasi log, jika $\lambda$ = 0,5 akar kuadrat, dst.
+
+```{r boxcox}
+bc_ci <- function(y) {
+  bc  <- MASS::boxcox(as.numeric(y) ~ 1, lambda = seq(-5, 5, by = 0.01), plotit = FALSE)
+  cut <- max(bc$y) - qchisq(0.95, 1) / 2
+  lam <- bc$x[bc$y > cut]
+  list(x = bc$x, y = bc$y, cut = cut,
+       opt = bc$x[which.max(bc$y)], lower = min(lam), upper = max(lam))
+}
+
+bc <- bc_ci(train_ts)
+
+plot(bc$x, bc$y, type = "l", lwd = 2, col = "steelblue",
+     xlab = expression(lambda), ylab = "log-likelihood",
+     main = "Plot Box-Cox Data Latih")
+abline(h = bc$cut, lty = 2, col = "gray40")
+abline(v = c(bc$lower, bc$opt, bc$upper), lty = c(3, 1, 3), col = c("red", "red", "red"))
+abline(v = 1, col = "darkgreen", lwd = 2)
+legend("bottomleft", c("Optimum & batas 95% CI", "lambda = 1"),
+       col = c("red", "darkgreen"), lty = 1, bty = "n", cex = 0.8)
+```
+
+```{r boxcox-tab}
+kable(data.frame(Keterangan = c("Lambda optimum", "Batas bawah CI 95%", "Batas atas CI 95%"),
+                 Nilai = round(c(bc$opt, bc$lower, bc$upper), 3)))
+```
+
+**Kesimpulan:** Plot Box-Cox data latih menghasilkan nilai lambda optimum sebesar 1,84 dengan selang kepercayaan 95% untuk λ sebesar [-1,05; 4,80]. Angka 1 (garis hijau) berada di dalam selang tersebut, sehingga data latih dinyatakan stasioner dalam ragam dan tidak perlu dilakukan transformasi.`
+
+# Tahap 3: Penanganan Ketidakstasioneran
+
+Berdasarkan hasil Tahap 2, data latih sudah stasioner dalam rataan (uji ADF menolak H0 dengan p-value ≤ 0,01) dan stasioner dalam ragam (selang kepercayaan Box-Cox 95% [-1,05; 4,80] mengandung angka 1). Dengan demikian tidak diperlukan transformasi maupun differencing, sehingga data latih dapat langsung digunakan untuk identifikasi model dengan orde differencing d = 0, yaitu model ARMA(p, q) atau ARIMA(p, 0, q).
+
+```{r penanganan}
+perlu_transformasi <- !(bc$lower <= 1 & bc$upper >= 1)
+lam <- if (perlu_transformasi) { if (abs(bc$opt) < 0.05) 0 else bc$opt } else NULL
+y_tr <- if (is.null(lam)) train_ts else BoxCox(train_ts, lam)
+
+d <- 0
+z <- y_tr
+p_adf <- suppressWarnings(adf.test(z)$p.value)
+while (p_adf >= 0.05 && d < 2) {
+  z <- diff(z)
+  d <- d + 1
+  p_adf <- suppressWarnings(adf.test(z)$p.value)
+}
+```
+
+- Transformasi ragam: **`r ifelse(is.null(lam), "tidak diperlukan (lambda = 1)", paste0("diperlukan, lambda = ", round(lam, 3)))`**
+- Orde differencing: **d = `r d`**
+- *p-value* uji ADF setelah penanganan: **`r sprintf("%.4f", p_adf)`**
+
+```{r plot-z}
+par(mfrow = c(1, 3))
+plot(z, main = paste0("Data Latih Setelah Penanganan (d = ", d, ")"), ylab = "z", col = "steelblue")
+acf(z, lag.max = 40, main = "ACF")
+pacf(z, lag.max = 40, main = "PACF")
+par(mfrow = c(1, 1))
+```
+
+```{r adf-z}
+adf.test(z)
+```
+Plot data latih setelah penanganan (d = 0) identik dengan data awal, berfluktuasi di sekitar rata-rata 26 °C tanpa tren yang jelas. Plot ACF meluruh secara bertahap dari sekitar 0,58 pada lag 1 hingga mendekati nol di sekitar lag 12, lalu berubah negatif dan membentuk pola gelombang (tails off). Plot PACF memiliki nilai yang menonjol dan melewati batas signifikansi pada lag 1 (sekitar 0,58), lag 2 (sekitar 0,20), dan lag 3 (sekitar 0,14), setelah itu nilainya kecil dan sebagian besar berada di dalam batas (cuts off setelah lag 2 atau 3). Uji ADF ulang menghasilkan p-value = 0,01 < 0,05, sehingga data tetap stasioner dalam rataan dan siap dipakai untuk identifikasi model.
+
+# Tahap 4: Identifikasi Model Potensial
+
+Model potensial ditentukan dari pola ACF, PACF, dan EACF pada data yang sudah stasioner (`z`).
+
+| Pola | Dugaan model |
+|:--|:--|
+| ACF terpotong (cuts off) setelah lag q, PACF meluruh | MA(q) |
+| PACF terpotong setelah lag p, ACF meluruh | AR(p) |
+| ACF dan PACF sama-sama meluruh | ARMA(p, q) |
+| EACF: titik pojok kiri atas segitiga "o" berada pada baris p, kolom q | ARMA(p, q) |
+
+## ACF dan PACF
+
+```{r acf-pacf}
+par(mfrow = c(1, 2))
+acf(z,  lag.max = 30, main = "ACF")
+pacf(z, lag.max = 30, main = "PACF")
+par(mfrow = c(1, 1))
+```
+
+## EACF
+
+```{r eacf}
+eacf(z, ar.max = 7, ma.max = 7)
+```
+
+## Penentuan kandidat model
+
+Plot ACF meluruh secara bertahap (tails off), sedangkan plot PACF terpotong (cuts off) setelah lag 2 hingga 3, sehingga mengindikasikan model AR(2) atau AR(3). Pada tabel EACF, baris p = 0 dipenuhi tanda "x", sedangkan pada baris p = 1 tanda "o" mulai muncul di kolom q = 1 dan membentuk segitiga ke arah kanan bawah, sehingga titik pojok kiri atas segitiga berada pada (1,1) yang mengindikasikan model ARMA(1,1). Model di sekitarnya, yaitu ARMA(1,2), ARMA(2,1), dan ARMA(2,2), juga dijadikan kandidat. Dengan demikian, model yang dievaluasi adalah ARIMA(1,0,1), ARIMA(1,0,2), ARIMA(2,0,1), ARIMA(2,0,2), ARIMA(2,0,0), ARIMA(3,0,0), dan ARIMA(3,0,1).
+
+```{r kandidat}
+kandidat_pq <- rbind(c(1, 1), c(1, 2), c(2, 1), c(2, 2),
+                     c(2, 0), c(3, 0), c(3, 1))
+colnames(kandidat_pq) <- c("p", "q")
+kable(data.frame(Model = paste0("ARIMA(", kandidat_pq[, 1], ",", d, ",", kandidat_pq[, 2], ")")))
+```
+
+# Tahap 5: Pendugaan Parameter, Uji Signifikansi, dan AIC
+
+Untuk setiap kandidat, parameter diduga dengan maximum likelihood (`Arima`). Uji signifikansi parameter:
+
+- $H_0$: parameter = 0 (tidak signifikan)
+- $H_1$: parameter $\neq$ 0 (signifikan)
+
+Tolak $H_0$ jika p-value < 0,05. Model terbaik adalah model dengan semua parameter AR/MA signifikan dan AIC terkecil.
+
+```{r fit-kandidat}
+fit_arima <- function(p, q) {
+  tryCatch(Arima(train_ts, order = c(p, d, q), lambda = lam),
+           error = function(e) NULL)
+}
+
+param_arma <- function(fit) {
+  ct <- lmtest::coeftest(fit)
+  ct[!(rownames(ct) %in% c("intercept", "drift")), , drop = FALSE]
+}
+
+fits <- list()
+tab  <- data.frame()
+for (i in seq_len(nrow(kandidat_pq))) {
+  p <- kandidat_pq[i, 1]; q <- kandidat_pq[i, 2]
+  nm  <- paste0("ARIMA(", p, ",", d, ",", q, ")")
+  fit <- fit_arima(p, q)
+  if (is.null(fit)) next
+  ct  <- param_arma(fit)
+  fits[[nm]] <- fit
+  tab <- rbind(tab, data.frame(
+    Model = nm,
+    Jumlah_Parameter = nrow(ct),
+    Parameter_Signifikan = sum(ct[, 4] < 0.05),
+    Semua_Signifikan = all(ct[, 4] < 0.05),
+    AIC = AIC(fit),
+    BIC = BIC(fit)
+  ))
+}
+tab <- tab[order(tab$AIC), ]
+rownames(tab) <- NULL
+kable(tab, digits = 3, caption = "Perbandingan model kandidat (diurutkan menurut AIC)")
+```
+
+Dari tujuh model kandidat, tiga model memiliki seluruh parameter signifikan pada taraf 5%, yaitu ARIMA(1,0,1), ARIMA(3,0,0), dan ARIMA(2,0,0). Di antara ketiganya, ARIMA(1,0,1) memiliki AIC terkecil (750,560) dan BIC terkecil (767,085), sehingga dipilih sebagai model terbaik. Model dengan tambahan orde, yaitu ARIMA(1,0,2), ARIMA(2,0,1), dan ARIMA(3,0,1), memiliki parameter yang tidak signifikan dan AIC yang lebih besar. Model ARIMA(2,0,2) bahkan tidak memiliki satu pun parameter signifikan. Ini mengindikasikan model terlalu rumit untuk data. ARIMA(2,0,0) signifikan tetapi AIC-nya jauh lebih besar (760,835, selisih sekitar 10), yang menunjukkan komponen MA diperlukan.
+
+```{r pilih}
+kand_ok <- tab[tab$Semua_Signifikan, ]
+best_nm <- if (nrow(kand_ok) > 0) kand_ok$Model[1] else tab$Model[1]
+best    <- fits[[best_nm]]
+```
+
+Model terpilih: **`r best_nm`** (`r ifelse(nrow(kand_ok) > 0, "semua parameter signifikan dan AIC terkecil di antara model yang signifikan", "tidak ada model dengan semua parameter signifikan, sehingga dipilih model ber-AIC terkecil")`).
+
+### Hasil pendugaan dan uji signifikansi parameter model terpilih
+
+```{r coef-best}
+lmtest::coeftest(best)
+```
+Model terpilih ARIMA(1,0,1) menghasilkan koefisien AR(1) sebesar 0,8624 (p-value < 2,2e-16), koefisien MA(1) sebesar -0,4594 (p-value = 1,929e-11), dan konstanta (rata-rata) sebesar 25,9475 (p-value < 2,2e-16). Karena seluruh p-value < 0,05, H0 ditolak untuk semua parameter, sehingga ketiga parameter berpengaruh signifikan terhadap model. Nilai |φ| = 0,8624 < 1 dan |θ| = 0,4594 < 1, sehingga model memenuhi syarat stasioneritas dan invertibility.
+
+```{r summary-best}
+summary(best)
+```
+
+# Tahap 6: Analisis Sisaan
+
+Model yang baik memiliki sisaan yang memenuhi asumsi: (1) menyebar normal, (2) tidak saling berkorelasi (white noise), (3) berrata-rata nol, dan (4) ragam homogen.
+
+```{r resid-plot}
+res <- as.numeric(residuals(best))
+
+par(mfrow = c(2, 2))
+qqnorm(res, main = "Normal Q-Q Plot Sisaan"); qqline(res, col = "red")
+plot(as.numeric(fitted(best)), res, xlab = "Nilai dugaan", ylab = "Sisaan",
+     main = "Sisaan vs Nilai Dugaan"); abline(h = 0, col = "red")
+acf(res, lag.max = 30, main = "ACF Sisaan")
+hist(res, breaks = 25, col = "lightblue", main = "Histogram Sisaan", xlab = "Sisaan")
+par(mfrow = c(1, 1))
+```
+
+```{r resid-time}
+plot(res, type = "l", col = "steelblue", ylab = "Sisaan", xlab = "t",
+     main = "Plot Sisaan terhadap Waktu")
+abline(h = 0, col = "red")
+```
+Normal Q-Q Plot: titik-titik sisaan hampir seluruhnya berada di sekitar garis diagonal, hanya sedikit menyimpang di kedua ujung (ekor). Ini mengindikasikan sisaan menyebar mendekati normal.
+
+Sisaan vs Nilai Dugaan: sisaan tersebar acak di sekitar garis nol tanpa pola sistematis (tidak melebar atau menyempit, tidak melengkung). Ini mengindikasikan nilai tengah sisaan sekitar nol dan ragam sisaan homogen.
+
+ACF Sisaan: hampir semua lag berada di dalam batas signifikansi (garis biru putus-putus), dengan beberapa lag (sekitar lag 8, 15, 21, dan 22) yang sedikit menyentuh atau melewati batas. Nilainya kecil (di bawah sekitar 0,13) dan tidak membentuk pola, sehingga mengindikasikan sisaan tidak berautokorelasi (white noise).
+
+Histogram: berbentuk lonceng, simetris di sekitar nol, sehingga sejalan dengan asumsi kenormalan.
+
+Plot Sisaan terhadap Waktu: sisaan berfluktuasi acak di sekitar nol dengan lebar yang relatif konstan sepanjang waktu, tanpa tren maupun pola berulang.
+
+## Uji formal
+
+```{r resid-tests}
+k <- length(coef(best)[!(names(coef(best)) %in% c("intercept", "drift"))])
+
+uji_norm  <- shapiro.test(res)                                         
+uji_jb    <- jarque.bera.test(res)                                      
+uji_lb    <- Box.test(res, lag = 20, type = "Ljung-Box", fitdf = k)     
+uji_mean  <- t.test(res, mu = 0)                                        
+uji_ragam <- Box.test(res^2, lag = 20, type = "Ljung-Box", fitdf = 0)   
+
+fp <- function(p) ifelse(p < 0.001, "< 0.001", sprintf("%.4f", p))
+
+hasil_uji <- data.frame(
+  Asumsi = c("Normalitas", "Normalitas", "Non-autokorelasi (white noise)",
+             "Nilai tengah sisaan = 0", "Kehomogenan ragam"),
+  Uji = c("Shapiro-Wilk", "Jarque-Bera", "Ljung-Box (lag 20)", "t-test", "Ljung-Box sisaan kuadrat (lag 20)"),
+  H0 = c("Sisaan menyebar normal", "Sisaan menyebar normal", "Tidak ada autokorelasi sisaan",
+         "Rataan sisaan = 0", "Ragam sisaan homogen"),
+  P_value = c(fp(uji_norm$p.value), fp(uji_jb$p.value), fp(uji_lb$p.value),
+              fp(uji_mean$p.value), fp(uji_ragam$p.value)),
+  Keputusan = c(ifelse(uji_norm$p.value < 0.05, "Tolak H0", "Gagal tolak H0"),
+                ifelse(uji_jb$p.value   < 0.05, "Tolak H0", "Gagal tolak H0"),
+                ifelse(uji_lb$p.value   < 0.05, "Tolak H0", "Gagal tolak H0"),
+                ifelse(uji_mean$p.value < 0.05, "Tolak H0", "Gagal tolak H0"),
+                ifelse(uji_ragam$p.value < 0.05, "Tolak H0", "Gagal tolak H0"))
+)
+kable(hasil_uji)
+```
+
+**Interpretasi uji formal (taraf nyata 5%)**
+
+- **Normalitas.** Uji Shapiro-Wilk (*p-value* = 0,8375) dan Jarque-Bera (*p-value* = 0,9697) menghasilkan *p-value* > 0,05 sehingga H0 tidak ditolak. Sisaan menyebar normal.
+- **Nilai tengah sisaan.** Uji-t menghasilkan *p-value* = 0,8503 > 0,05 sehingga H0 tidak ditolak. Rataan sisaan tidak berbeda nyata dari nol.
+- **Kehomogenan ragam.** Uji Ljung-Box pada sisaan kuadrat menghasilkan *p-value* = 0,8925 > 0,05 sehingga H0 tidak ditolak. Ragam sisaan homogen dan tidak terdapat efek ARCH.
+- **Non-autokorelasi.** Uji Ljung-Box (lag 20) menghasilkan *p-value* = 0,0404 < 0,05 sehingga H0 ditolak. Pada taraf nyata 5% masih terdapat autokorelasi pada sisaan. Namun nilainya hanya sedikit di bawah 0,05 (tidak signifikan pada taraf 1%), dan pada plot ACF sisaan hanya beberapa lag yang sedikit melewati batas dengan nilai yang kecil. Sisa autokorelasi ini kemungkinan berasal dari pola musiman tahunan yang terlihat pada plot ACF data latih dan tidak dapat ditangkap oleh model ARIMA non-musiman.
+
+**Kesimpulan analisis sisaan.** Model ARIMA(1,0,1) memenuhi asumsi normalitas, nilai tengah nol, dan kehomogenan ragam, serta memenuhi asumsi non-autokorelasi secara marginal. Pelanggaran yang terjadi tergolong kecil, sehingga model masih layak digunakan untuk peramalan. Untuk perbaikan, dapat dipertimbangkan model musiman (SARIMA) sebagai pengembangan.
+
+# Tahap 7: Overfitting
+
+Overfitting dilakukan dengan menambah satu orde pada model terpilih: ARIMA(p+1, d, q) dan ARIMA(p, d, q+1). Model terpilih dianggap sudah tepat jika model overfitting tidak memberi perbaikan (parameter tambahan tidak signifikan dan/atau AIC tidak lebih kecil).
+
+```{r overfit}
+p0 <- kandidat_pq[match(best_nm, paste0("ARIMA(", kandidat_pq[, 1], ",", d, ",", kandidat_pq[, 2], ")")), 1]
+q0 <- kandidat_pq[match(best_nm, paste0("ARIMA(", kandidat_pq[, 1], ",", d, ",", kandidat_pq[, 2], ")")), 2]
+
+ov <- list(
+  list(nm = paste0("ARIMA(", p0 + 1, ",", d, ",", q0, ")"), p = p0 + 1, q = q0, extra = paste0("ar", p0 + 1)),
+  list(nm = paste0("ARIMA(", p0, ",", d, ",", q0 + 1, ")"), p = p0, q = q0 + 1, extra = paste0("ma", q0 + 1))
+)
+
+tab_ov <- data.frame(Model = best_nm, Parameter_Tambahan = "-", P_value_Tambahan = NA,
+                     AIC = AIC(best), Lebih_Baik = "-")
+for (o in ov) {
+  f <- fit_arima(o$p, o$q)
+  if (is.null(f)) {
+    tab_ov <- rbind(tab_ov, data.frame(Model = o$nm, Parameter_Tambahan = o$extra,
+                                       P_value_Tambahan = NA, AIC = NA, Lebih_Baik = "gagal konvergen"))
+    next
+  }
+  ct <- lmtest::coeftest(f)
+  pv <- ct[o$extra, 4]
+  tab_ov <- rbind(tab_ov, data.frame(
+    Model = o$nm, Parameter_Tambahan = o$extra, P_value_Tambahan = pv, AIC = AIC(f),
+    Lebih_Baik = ifelse(pv < 0.05 & AIC(f) < AIC(best), "Ya", "Tidak")))
+}
+kable(tab_ov, digits = 4, caption = "Hasil overfitting")
+```
+
+```{r overfit-kes}
+overfit_lebih_baik <- any(tab_ov$Lebih_Baik == "Ya")
+```
+
+**Hasil overfitting**
+
+Overfitting dilakukan dengan menambahkan satu orde pada model terpilih ARIMA(1,0,1), yaitu menambah orde AR menjadi ARIMA(2,0,1) dan menambah orde MA menjadi ARIMA(1,0,2). Model terpilih dianggap sudah tepat apabila parameter tambahan tidak signifikan dan/atau AIC model overfitting tidak lebih kecil.
+
+- **ARIMA(2,0,1).** Parameter tambahan AR(2) memiliki *p-value* = 0,2157 > 0,05 sehingga tidak signifikan. AIC model ini sebesar 751,1629, lebih besar dari AIC ARIMA(1,0,1) sebesar 750,5604.
+- **ARIMA(1,0,2).** Parameter tambahan MA(2) memiliki *p-value* = 0,2022 > 0,05 sehingga tidak signifikan. AIC model ini sebesar 750,9862, juga lebih besar dari AIC ARIMA(1,0,1).
+
+**Kesimpulan.** Penambahan orde AR maupun MA tidak memberikan perbaikan, karena parameter tambahan tidak signifikan dan nilai AIC tidak menjadi lebih kecil. Dengan demikian model ARIMA(1,0,1) sudah tepat dan ditetapkan sebagai model final yang digunakan untuk peramalan.
+
+# Tahap 8: Peramalan (Forecasting)
+
+## Peramalan pada periode data uji
+
+Model final (`r best_nm`) digunakan untuk meramalkan `r n_test` minggu ke depan, kemudian dibandingkan dengan data uji.
+
+```{r forecast}
+fc <- forecast(best, h = n_test, level = c(80, 95))
+
+hasil <- data.frame(
+  minggu  = test$minggu,
+  aktual  = test$y,
+  ramalan = as.numeric(fc$mean),
+  lo80 = as.numeric(fc$lower[, 1]), hi80 = as.numeric(fc$upper[, 1]),
+  lo95 = as.numeric(fc$lower[, 2]), hi95 = as.numeric(fc$upper[, 2])
+)
+
+rmse <- sqrt(mean((hasil$aktual - hasil$ramalan)^2))
+mae  <- mean(abs(hasil$aktual - hasil$ramalan))
+mape <- mean(abs((hasil$aktual - hasil$ramalan) / hasil$aktual)) * 100
+
+rmse_tr <- sqrt(mean((train$y - as.numeric(fitted(best)))^2))
+mape_tr <- mean(abs((train$y - as.numeric(fitted(best))) / train$y)) * 100
+```
+
+```{r plot-forecast}
+tampil <- train[(n_train - 103):n_train, c("minggu", "y")]   # 2 tahun terakhir data latih
+
+ggplot() +
+  geom_line(data = tampil, aes(minggu, y, color = "Data latih")) +
+  geom_line(data = hasil, aes(minggu, aktual, color = "Data uji (aktual)")) +
+  geom_ribbon(data = hasil, aes(minggu, ymin = lo95, ymax = hi95), fill = "orange", alpha = 0.15) +
+  geom_ribbon(data = hasil, aes(minggu, ymin = lo80, ymax = hi80), fill = "orange", alpha = 0.30) +
+  geom_line(data = hasil, aes(minggu, ramalan, color = "Ramalan"), linewidth = 1) +
+  scale_color_manual(values = c("Data latih" = "steelblue", "Data uji (aktual)" = "firebrick",
+                                "Ramalan" = "darkorange")) +
+  labs(title = paste("Peramalan", best_nm, "vs Data Uji"),
+       subtitle = "Pita oranye: selang prediksi 80% dan 95%",
+       x = "Minggu", y = "Tavg (°C)", color = "") +
+  theme_minimal()
+```
+
+## Akurasi peramalan
+
+```{r akurasi}
+kable(data.frame(
+  Ukuran = c("RMSE", "MAE", "MAPE (%)"),
+  Data_Latih = c(rmse_tr, NA, mape_tr),
+  Data_Uji = c(rmse, mae, mape)), digits = 4)
+```
+
+**Hasil peramalan pada data uji**
+
+Model ARIMA(1,0,1) digunakan untuk meramalkan suhu rata-rata mingguan pada periode data uji. Pada plot, garis ramalan (oranye) naik dari nilai terakhir data latih lalu dengan cepat mendatar dan konvergen ke nilai rata-rata sekitar 26 °C. Pola ini wajar untuk model ARIMA(p,0,q) yang stasioner: pengaruh nilai-nilai sebelumnya melemah seiring bertambahnya horizon, sehingga ramalan jangka panjang mendekati rata-rata deret. Data aktual (garis merah) berfluktuasi di sekitar garis ramalan dan hampir seluruhnya berada di dalam selang prediksi 95%, dengan sebagian titik puncak dan lembah berada di luar selang 80%. Selang prediksi melebar di awal lalu stabil karena galat ramalan model stasioner menuju nilai yang tetap.
+
+**Akurasi peramalan**
+
+| Ukuran | Data Latih | Data Uji |
+|:--|--:|--:|
+| RMSE | 0,5420 | 0,6241 |
+| MAE | - | 0,5052 |
+| MAPE (%) | 1,6668 | 1,9483 |
+
+Pada data uji diperoleh RMSE sebesar 0,6241, MAE sebesar 0,5052, dan MAPE sebesar 1,95%. Nilai MAPE di bawah 10% menunjukkan bahwa kemampuan peramalan model tergolong sangat baik. Secara rata-rata, ramalan menyimpang sekitar 0,5 °C dari nilai aktual. Nilai RMSE dan MAPE data uji hanya sedikit lebih besar dibandingkan data latih (0,6241 berbanding 0,5420 untuk RMSE, dan 1,95% berbanding 1,67% untuk MAPE), sehingga tidak terdapat indikasi overfitting yang berarti terhadap data latih.
+
+**Keterbatasan.** Karena model ARIMA(1,0,1) tidak memuat komponen musiman, ramalan cenderung mendatar dan tidak menangkap naik-turun suhu yang berulang sekitar tiap tahun pada data uji. Hal ini juga terlihat dari sisa autokorelasi yang kecil pada analisis sisaan. Untuk pengembangan, dapat dicoba model musiman (SARIMA).
+
+## Peramalan ke depan (di luar data)
+
+Model dengan parameter yang sama diterapkan pada seluruh data (latih + uji), lalu diramalkan 26 minggu (sekitar 6 bulan) ke depan.
+
+```{r forecast-depan}
+refit <- Arima(full_ts, model = best)
+fc2   <- forecast(refit, h = 26, level = c(80, 95))
+
+tgl_depan <- seq(max(dat$minggu) + 7, by = "week", length.out = 26)
+depan <- data.frame(minggu = tgl_depan, ramalan = as.numeric(fc2$mean),
+                    lo95 = as.numeric(fc2$lower[, 2]), hi95 = as.numeric(fc2$upper[, 2]))
+
+ggplot() +
+  geom_line(data = dat[(n - 103):n, ], aes(minggu, y), color = "steelblue") +
+  geom_ribbon(data = depan, aes(minggu, ymin = lo95, ymax = hi95), fill = "orange", alpha = 0.25) +
+  geom_line(data = depan, aes(minggu, ramalan), color = "darkorange", linewidth = 1) +
+  labs(title = "Peramalan 26 Minggu ke Depan", x = "Minggu", y = "Tavg (°C)") +
+  theme_minimal()
+
+kable(head(depan, 10), digits = 3, caption = "10 minggu pertama hasil peramalan")
+```
+
+**Peramalan ke depan (di luar data)**
+
+Model ARIMA(1,0,1) dengan parameter yang sama diterapkan pada seluruh data (latih dan uji), lalu digunakan untuk meramalkan suhu rata-rata mingguan 26 minggu (sekitar 6 bulan) setelah data terakhir. Data terakhir berada pada nilai yang relatif rendah (sekitar 24,7 °C), sehingga ramalan dimulai dari sekitar 25,3 °C, kemudian naik secara bertahap dan melandai menuju sekitar 26 °C. Nilai ini mendekati rata-rata jangka panjang suhu (sekitar 25,95 °C), sesuai dengan sifat model ARIMA(p,0,q) yang stasioner, yaitu ramalan jangka panjang kembali ke rata-rata deret. Selang prediksi 95% (pita oranye) melebar di beberapa minggu pertama, lalu relatif stabil pada kisaran sekitar 24,6 °C sampai 27,3 °C. Selang yang stabil ini menunjukkan bahwa ketidakpastian ramalan tidak terus membesar, karena galat ramalan model stasioner menuju nilai yang tetap. Perlu dicatat bahwa ramalan jangka panjang bersifat mendatar dan tidak menangkap pola naik-turun musiman, sehingga lebih cocok dipakai sebagai gambaran kisaran suhu, bukan prediksi nilai mingguan yang tepat.
+
+# Kesimpulan
+
+1. Data suhu rata-rata mingguan stasiun 96071 sebanyak 575 amatan dibagi menjadi 460 data latih dan 115 data uji (proporsi 80:20).
+2. Pada data latih, uji ADF menghasilkan p-value ≤ 0,01 sehingga data stasioner dalam rataan, dan selang kepercayaan Box-Cox 95% sebesar [-1,05; 4,80] mengandung angka 1 sehingga data stasioner dalam ragam. Dengan demikian tidak diperlukan transformasi maupun differencing (d = 0).
+3. Berdasarkan plot ACF, PACF, dan EACF diperoleh tujuh kandidat model. Model terbaik adalah ARIMA(1,0,1) karena seluruh parameternya signifikan dan memiliki AIC terkecil (750,56) serta BIC terkecil (767,09). Persamaan modelnya adalah $Z_t - 25{,}9475 = 0{,}8624\,(Z_{t-1} - 25{,}9475) + e_t - 0{,}4594\,e_{t-1}$.
+4. Analisis sisaan menunjukkan bahwa sisaan menyebar normal, berrata-rata nol, dan berragam homogen. Asumsi non-autokorelasi terpenuhi secara marginal (Ljung-Box lag 20, *p-value* = 0,0404), kemungkinan karena pola musiman tahunan yang tidak ditangkap model non-musiman.
+5. Uji overfitting dengan ARIMA(2,0,1) dan ARIMA(1,0,2) tidak memberi perbaikan (parameter tambahan tidak signifikan dan AIC lebih besar), sehingga ARIMA(1,0,1) ditetapkan sebagai model final.
+6. Pada data uji, model menghasilkan RMSE = 0,624, MAE = 0,505, dan MAPE = 1,95%, sehingga kemampuan peramalannya tergolong sangat baik. Ramalan 26 minggu ke depan menunjukkan suhu menuju rata-rata jangka panjang sekitar 26 °C.
+7. Sebagai pengembangan, model musiman (SARIMA) dapat dicoba untuk menangkap pola naik-turun suhu yang berulang setiap tahun.
